@@ -73,7 +73,9 @@ test-device:
 	tooling/bin/with-local-stack -- ...
 ```
 
-`tooling.mk` reads `tooling.env`, includes `mk/supabase-local.mk` when the footprints have `supabase`, and defines `tooling-check` and `tooling-version`.
+`tooling.mk` reads `tooling.env`, includes `mk/supabase-local.mk` when the footprints have `supabase`, and defines `tooling-help`, `tooling-check` and `tooling-version`.
+
+A bare `make` starts nothing: unless the app sets `.DEFAULT_GOAL` (before or after the include), the default goal is `tooling-help`.
 
 ## Vendoring
 
@@ -91,7 +93,7 @@ Copies `VERSION`, `README.md`, `mk/` and `bin/` into `my-app/tooling/`, removes 
 | `bin/with-local-stack [--functions] -- CMD` | Up, run CMD, always down; exits with CMD's status |
 | `bin/logged NAME -- CMD` | Full output to `build/logs/NAME-<timestamp>-<pid>.log` (never overwritten); prints `✓`/`✗`, duration and the log path; exits with CMD's status |
 | `bin/ios-sim` | Prints a simulator UDID: `$SIM_UDID`, else the device named `$IOS_SIM_DEVICE` (booted if needed), else the first booted iOS simulator |
-| `bin/xcuitest NAME -- ARGS` | `xcodebuild test ARGS` with the log kept, only `Test Case` / `Test Suite` / `error:` lines shown, xcodebuild's status, fails when no tests ran |
+| `bin/xcuitest NAME -- ARGS` | `xcodebuild test ARGS` with the log kept, only `Test Case` / `Test Suite` / `error:` lines shown, xcodebuild's status, fails when no tests ran. With the `flutter` footprint it first runs `flutter build ios --simulator --debug --config-only` (logged as `NAME-flutter-config`) so a stale `Generated.xcconfig` left by `flutter test integration_test` cannot fail the build; set `XCUITEST_SKIP_FLUTTER_CONFIG=1` to skip it |
 | `bin/tooling-check [APP_DIR]` | The conformance check (python3, standard library only) |
 | `bin/tooling-sync APP_DIR` | Vendor this repo into an app |
 

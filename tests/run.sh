@@ -41,12 +41,19 @@ exit 0
 EOF
 cat > "$STUBS/xcodebuild" <<'EOF'
 #!/usr/bin/env bash
+echo "xcodebuild $*" >> "$STUB_LOG"
 echo "NOISE compiling"
 case "${XCB_MODE:-ok}" in
   ok)   echo "Test Suite 'All tests' started"; echo "Test Case '-[A t1]' passed"; exit 0 ;;
   fail) echo "Test Case '-[A t1]' failed"; echo "x.swift:1: error: boom"; exit 65 ;;
   zero) echo "Executed 0 tests, with 0 failures"; exit 0 ;;
 esac
+EOF
+cat > "$STUBS/flutter" <<'EOF'
+#!/usr/bin/env bash
+echo "flutter $*" >> "$STUB_LOG"
+[ -z "${FLUTTER_FAIL:-}" ] || exit 4
+exit 0
 EOF
 cat > "$STUBS/xcrun" <<'EOF'
 #!/usr/bin/env bash
@@ -173,6 +180,7 @@ check "one log file per run, the first untouched" \
 
 echo "xcuitest"
 mkdir -p "$T/xc"
+export TOOLING_APP_ROOT="$T/xc"
 out="$(cd "$T/xc" && XCB_MODE=fail "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?
 check "passes through a failing xcodebuild status" "$([ $st -eq 65 ] && echo 0 || echo 1)" "$out"
 check "prints only Test Case/Suite/error lines" "$(echo "$out" | grep -q 'error: boom' && ! echo "$out" | grep -q NOISE && echo 0 || echo 1)" "$out"
@@ -181,6 +189,23 @@ out="$(cd "$T/xc" && XCB_MODE=zero "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; 
 check "fails a run that executed 0 tests" "$([ $st -ne 0 ] && echo "$out" | grep -q 'no tests executed' && echo 0 || echo 1)" "$out"
 out="$(cd "$T/xc" && XCB_MODE=ok "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?
 check "passes a run with passing tests" "$([ $st -eq 0 ] && echo 0 || echo 1)" "$out"
+
+mkdir -p "$T/xcf"; echo 'TOOLING_FOOTPRINTS=flutter' > "$T/xcf/tooling.env"
+: > "$STUB_LOG"
+out="$(cd "$T/xcf" && TOOLING_APP_ROOT="$T/xcf" "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?
+check "flutter footprint: regenerates the iOS config first (logged), then runs xcodebuild" \
+  "$([ $st -eq 0 ] && [ "$(sed -n 1p "$STUB_LOG")" = 'flutter build ios --simulator --debug --config-only' ] && sed -n 2p "$STUB_LOG" | grep -q '^xcodebuild test' && ls "$T"/xcf/build/logs/ui-flutter-config-*.log >/dev/null 2>&1 && echo 0 || echo 1)" "$out
+$(cat "$STUB_LOG")"
+: > "$STUB_LOG"
+out="$(cd "$T/xcf" && XCUITEST_SKIP_FLUTTER_CONFIG=1 TOOLING_APP_ROOT="$T/xcf" "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?
+check "XCUITEST_SKIP_FLUTTER_CONFIG=1 skips it" "$([ $st -eq 0 ] && ! grep -q '^flutter' "$STUB_LOG" && echo 0 || echo 1)" "$out"
+: > "$STUB_LOG"
+out="$(cd "$T/xcf" && FLUTTER_FAIL=1 TOOLING_APP_ROOT="$T/xcf" "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?
+check "a failing config step stops the run with its status" "$([ $st -eq 4 ] && ! grep -q '^xcodebuild' "$STUB_LOG" && echo 0 || echo 1)" "$out"
+: > "$STUB_LOG"
+out="$(cd "$T/xc" && "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"
+check "no flutter footprint: no config step" "$(! grep -q '^flutter' "$STUB_LOG" && echo 0 || echo 1)"
+unset TOOLING_APP_ROOT
 
 echo "with-local-stack"
 cat > "$T/fake-sl" <<'EOF'
@@ -263,6 +288,11 @@ d="$(fixture clean)"; printf 'test-lint:\n\t@lint || true # tooling: allow-soft\
 check "allow-soft exempts a line" "$([ $st -eq 0 ] && echo 0 || echo 1)" "$out"
 d="$(fixture clean)"; printf 'release:\n\t@ship || :\n' >> "$d/Makefile"; out="$(chk "$d")"; st=$?
 check "fails on '|| :' in a standard target" "$([ $st -ne 0 ] && echo "$out" | grep -q "'release'" && echo 0 || echo 1)" "$out"
+d="$(fixture clean)"; rm -rf "$LOCK"; : > "$STUB_LOG"; out="$(cd "$d" && make 2>&1)"; st=$?
+check "a bare make starts nothing (default goal is tooling-help)" "$([ $st -eq 0 ] && echo "$out" | grep -q 'Standard targets' && [ ! -s "$STUB_LOG" ] && [ ! -e "$LOCK" ] && echo 0 || echo 1)" "$out"
+d="$(fixture clean)"; { echo '.DEFAULT_GOAL := test'; cat "$d/Makefile"; } > "$d/M" && mv "$d/M" "$d/Makefile"; : > "$STUB_LOG"
+out="$(cd "$d" && make 2>&1)"
+check "a default goal set by the app before the include is kept" "$(echo "$out" | grep -q 'flutter test' && [ ! -s "$STUB_LOG" ] && echo 0 || echo 1)" "$out"
 d="$(fixture clean)"; out="$(cd "$d" && make tooling-version)"
 check "make tooling-version prints the vendored version" "$([ "$out" = "$(cat "$REPO/VERSION")" ] && echo 0 || echo 1)" "$out"
 d="$(fixture clean)"; out="$(cd "$d" && make local-functions ENV=prod 2>&1)"; st=$?

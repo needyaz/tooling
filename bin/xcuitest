@@ -3,10 +3,36 @@
 # Runs `xcodebuild test ARGS` with the full output kept in a log (via logged), prints only the
 # Test Case / Test Suite / error: lines, and exits with xcodebuild's status. A run that executed no
 # tests fails, even when xcodebuild exited 0.
+#
+# With the flutter footprint it first runs `flutter build ios --simulator --debug --config-only` (logged as
+# NAME-flutter-config). `flutter test integration_test` leaves Generated.xcconfig and
+# flutter_export_environment.sh pointing at a deleted temporary target, and the xcodebuild that follows
+# would fail with 65. Opt out with XCUITEST_SKIP_FLUTTER_CONFIG=1 (environment or tooling.env).
 set -u
+
+ROOT="${TOOLING_APP_ROOT:-$(cd -P "$(dirname "$0")/../.." && pwd -P)}"
+if [ -f "$ROOT/tooling.env" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"; v="${line#*=}"
+    k="$(printf '%s' "$k" | tr -d '[:space:]')"
+    case "$k" in *[!A-Za-z0-9_]*|'') continue ;; esac
+    [ -n "${!k+x}" ] || export "$k=$v"
+  done < "$ROOT/tooling.env"
+fi
 
 [ "$#" -ge 3 ] && [ "$2" = "--" ] || { echo "usage: xcuitest NAME -- XCODEBUILD-ARGS..." >&2; exit 2; }
 name="$1"; shift 2
+
+case " ${TOOLING_FOOTPRINTS:-} " in
+  *" flutter "*)
+    if [ -z "${XCUITEST_SKIP_FLUTTER_CONFIG:-}" ]; then
+      cfg="$("$(dirname "$0")/logged" "$name-flutter-config" -- flutter build ios --simulator --debug --config-only)"
+      rc=$?
+      echo "$cfg"
+      [ "$rc" -eq 0 ] || exit "$rc"
+    fi ;;
+esac
 
 summary="$("$(dirname "$0")/logged" "$name" -- xcodebuild test "$@")"
 rc=$?
