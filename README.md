@@ -53,12 +53,14 @@ IOS_SIM_DEVICE=iPhone 17 Pro
 | `SUPABASE_LOCAL_URL` | API URL, loopback only (default `http://127.0.0.1:54321`) |
 | `SUPABASE_FUNCTIONS_SRC` | Edge functions directory (default `supabase/functions`) |
 | `SUPABASE_NO_JWT_FUNCTIONS` | Functions served without JWT verification |
+| `SUPABASE_LOCAL_DB_PORT` | Postgres port for `db-url` (default `54322`) |
 | `SUPABASE_FUNCTIONS_PROBE` | Function polled until it answers 200 (default `fn-version`) |
 | `SUPABASE_LOCAL_EXCLUDE` | Services not started (default `studio,imgproxy,mailpit,logflare,vector,postgres-meta`) |
 | `SUPABASE_LOCAL_AFTER_UP` | Command run in the app root after `local-up`, for example seeding |
 | `IOS_SIM_DEVICE` | Simulator name for `ios-sim` |
 | `TOOLING_LOCK_DIR` | Machine-wide locks (default `~/.cache/tooling/locks`) |
 | `TOOLING_LOCK_TIMEOUT` / `TOOLING_LOCK_INTERVAL` | Seconds to wait for the stack lock (900) and between tries (5) |
+| `TOOLING_STOP_WAIT` | Seconds `functions-down` waits after TERM before KILL (10) |
 | `TOOLING_LOCK_STALE_AFTER` | Seconds before a lock whose container is not running is broken (300) |
 
 ### App Makefile
@@ -89,7 +91,7 @@ Copies `VERSION`, `README.md`, `mk/` and `bin/` into `my-app/tooling/`, removes 
 
 | Command | Does |
 |---|---|
-| `bin/supabase-local` | The local Supabase stack: `up`, `down`, `status`, `url`, `key`, `servicekey`, `container`, `guard-file`, `workdir`, `abs-workdir`, `lock`, `unlock`, `functions-up`, `functions-down`, `functions-status`, `admin-secret`, `db` |
+| `bin/supabase-local` | The local Supabase stack: `up`, `down`, `status`, `url`, `key`, `servicekey`, `container`, `guard-file`, `workdir`, `abs-workdir`, `lock`, `unlock`, `functions-up`, `functions-down`, `functions-status`, `admin-secret`, `db`, `db-url` |
 | `bin/with-local-stack [--functions] -- CMD` | Up, run CMD, always down; exits with CMD's status |
 | `bin/logged NAME -- CMD` | Full output to `build/logs/NAME-<timestamp>-<pid>.log` (never overwritten); prints `✓`/`✗`, duration and the log path; exits with CMD's status |
 | `bin/ios-sim` | Prints a simulator UDID: `$SIM_UDID`, else the device named `$IOS_SIM_DEVICE` (booted if needed), else the first booted iOS simulator |
@@ -102,6 +104,8 @@ Copies `VERSION`, `README.md`, `mk/` and `bin/` into `my-app/tooling/`, removes 
 - One stack at a time: every local stack uses the same default ports, so each holds a machine-wide lock. A lock whose database container is not running and which is older than `TOOLING_LOCK_STALE_AFTER` is broken.
 - `local-up` starts from a generated copy of `supabase/config.toml` in `build/local-supabase/` with boot migrations off. The app's `config.toml` is never changed.
 - `local-functions` serves the app's functions with fake per-run secrets (`FN_VERSION`, `ADMIN_SECRET`) and no provider keys. It refuses an explicit `ENV` other than `local`.
+- `functions-up` runs `supabase functions serve` in its own process group (`setsid`, or python3 `os.setsid` where there is none) and records the group id. `functions-down` sends TERM to the whole group, waits `TOOLING_STOP_WAIT` seconds (10), sends KILL, and warns if processes remain. A group whose leader died counts as running for stop and is never reused: `functions-up` stops it and starts fresh.
+- `db-url` prints `postgresql://postgres:postgres@127.0.0.1:<port>/postgres` for `supabase db push --db-url`. The port is `SUPABASE_LOCAL_DB_PORT` (default 54322; digits only, 1-65535, no leading zero, otherwise an error). It does not need the stack running.
 - Nothing links, logs in or contacts a remote project.
 
 ## `tooling-check`

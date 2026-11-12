@@ -36,6 +36,13 @@ id="$(sed -n 's/^project_id = "\(.*\)"/\1/p' build/local-supabase/supabase/confi
 case "$1" in
   start) touch "$STUB_STATE/running/supabase_db_$id" ;;
   stop)  rm -f "$STUB_STATE/running/supabase_db_$id" ;;
+  functions)
+    # `functions serve`: a leader that forks a child, like the real CLI.
+    touch "$STUB_STATE/running/supabase_edge_runtime_$id"
+    sleep 300 > /dev/null 2>&1 &
+    echo $! > "$STUB_STATE/fn-child"
+    echo "Serving functions"
+    wait ;;
 esac
 exit 0
 EOF
@@ -48,6 +55,10 @@ case "${XCB_MODE:-ok}" in
   fail) echo "Test Case '-[A t1]' failed"; echo "x.swift:1: error: boom"; exit 65 ;;
   zero) echo "Executed 0 tests, with 0 failures"; exit 0 ;;
 esac
+EOF
+cat > "$STUBS/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 200
 EOF
 cat > "$STUBS/flutter" <<'EOF'
 #!/usr/bin/env bash
@@ -155,6 +166,45 @@ SL down >/dev/null 2>&1
 check "down stops the stack, drops the guard and releases the lock" \
   "$(grep -q 'supabase stop' "$STUB_LOG" && [ ! -e "$APP/build/local-supabase/guard" ] && [ ! -e "$LOCK" ] && echo 0 || echo 1)"
 unset SUPABASE_LOCAL_ID
+
+echo "supabase-local db-url"
+out="$(env -u SUPABASE_LOCAL_DB_PORT "$REPO/bin/supabase-local" db-url 2>&1)"
+check "db-url defaults to port 54322, no stack needed" "$([ "$out" = postgresql://postgres:postgres@127.0.0.1:54322/postgres ] && echo 0 || echo 1)" "$out"
+out="$(SUPABASE_LOCAL_DB_PORT=65535 SL db-url 2>&1)"
+check "db-url takes SUPABASE_LOCAL_DB_PORT" "$([ "$out" = postgresql://postgres:postgres@127.0.0.1:65535/postgres ] && echo 0 || echo 1)" "$out"
+for bad in abc 0 054322 65536 -1 5432.1 '' ' 5432' 1234567890123; do
+  out="$(SUPABASE_LOCAL_DB_PORT="$bad" SL db-url 2>&1)"; st=$?
+  check "db-url rejects SUPABASE_LOCAL_DB_PORT='$bad'" "$([ $st -eq 1 ] && echo "$out" | grep -q 'SUPABASE_LOCAL_DB_PORT' && echo 0 || echo 1)" "$out"
+done
+
+echo "supabase-local functions (process group)"
+export SUPABASE_LOCAL_ID=fnapp TOOLING_STOP_WAIT=2
+mkdir -p "$APP/supabase/functions/fn-version"; echo x > "$APP/supabase/functions/fn-version/index.ts"
+reset_stack; rm -f "$STATE/fn-child"
+SL up >/dev/null 2>&1
+BW="$APP/build/local-supabase"
+alive() { kill -0 "$1" 2>/dev/null; }
+gone() { local i; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do alive "$1" || return 0; sleep 0.2; done; return 1; }
+out="$(SL functions-up 2>&1)"; st=$?
+child1="$(cat "$STATE/fn-child")"; leader1="$(cat "$BW/functions.pid")"
+check "functions-up serves in its own group, recorded" \
+  "$([ $st -eq 0 ] && [ "$(cat "$BW/functions.pgid")" = "$leader1" ] && [ "$(ps -o pgid= -p "$child1" | tr -d ' ')" = "$leader1" ] && echo 0 || echo 1)" "$out"
+SL functions-down >/dev/null 2>&1
+check "functions-down kills the whole group (the forked child too)" \
+  "$(gone "$child1" && gone "$leader1" && [ ! -e "$BW/functions.pgid" ] && echo 0 || echo 1)"
+
+SL functions-up >/dev/null 2>&1
+child1="$(cat "$STATE/fn-child")"; leader1="$(cat "$BW/functions.pid")"
+kill -9 "$leader1"; gone "$leader1"
+check "after the leader dies the group is leaderless and still running" \
+  "$(alive "$child1" && SL functions-status | grep -q leaderless && echo 0 || echo 1)"
+out="$(SL functions-up 2>&1)"; st=$?
+child2="$(cat "$STATE/fn-child")"; leader2="$(cat "$BW/functions.pid")"
+check "functions-up stops a leaderless group and starts a fresh one" \
+  "$([ $st -eq 0 ] && gone "$child1" && [ "$child2" != "$child1" ] && alive "$child2" && alive "$leader2" && [ "$leader2" != "$leader1" ] && echo 0 || echo 1)" "$out"
+SL down >/dev/null 2>&1
+check "down also stops the functions group" "$(gone "$child2" && echo 0 || echo 1)"
+unset SUPABASE_LOCAL_ID TOOLING_STOP_WAIT
 
 echo "supabase-local abs-workdir"
 mkdir -p "$T/real/app/tooling" "$T/real/app/supabase"

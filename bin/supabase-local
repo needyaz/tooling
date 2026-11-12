@@ -19,12 +19,15 @@
 #   supabase-local admin-secret   the per-run fake ADMIN_SECRET (empty if functions are not staged)
 #   supabase-local db -f FILE     run a multi-statement SQL file in the local database
 #   supabase-local db "SQL"       run one statement
+#   supabase-local db-url         the loopback Postgres URL for `supabase db push --db-url` (stack not needed)
 #
 # Configuration: KEY=VALUE lines in the app's tooling.env (no quotes), overridden by the environment.
 #   SUPABASE_LOCAL_ID          stack name, used in container names (default: <app dir name>-local)
 #   SUPABASE_LOCAL_URL         API URL, loopback only (default http://127.0.0.1:54321)
 #   SUPABASE_FUNCTIONS_SRC     edge functions directory (default supabase/functions)
 #   SUPABASE_NO_JWT_FUNCTIONS  space-separated functions served without JWT verification
+#   SUPABASE_LOCAL_DB_PORT     Postgres port for db-url (default 54322; digits, 1-65535, no leading zero)
+#   TOOLING_STOP_WAIT          seconds functions-down waits after TERM before KILL (default 10)
 #   SUPABASE_FUNCTIONS_PROBE   function polled until it answers 200 (default fn-version)
 #   SUPABASE_LOCAL_EXCLUDE     services not started (default: studio,imgproxy,mailpit,logflare,vector,postgres-meta)
 #   SUPABASE_LOCAL_AFTER_UP    a command run after `up` (for example the app's guard seeding)
@@ -68,6 +71,7 @@ FN_SRC="${SUPABASE_FUNCTIONS_SRC:-supabase/functions}"
 FN_DIR="$WD/supabase/functions"
 ENVF="$WD/functions.env"
 PIDF="$WD/functions.pid"
+GRPF="$WD/functions.pgid"
 LOGF="$WD/functions.log"
 
 LOCK="${TOOLING_LOCK_DIR:-$HOME/.cache/tooling/locks}/supabase-stack.lock"
@@ -160,6 +164,60 @@ arm_guard() { ( umask 077; [ -s "$GUARD_FILE" ] || od -An -N32 -tx1 /dev/urandom
 
 # --- functions --------------------------------------------------------------------------------------
 fn_serving() { [ -s "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+
+# `supabase functions serve` runs in its own process group (the CLI forks helpers), recorded in GRPF, so
+# stopping signals the whole group. A group whose leader has died is "leaderless": it still counts as
+# running for stop, and `functions-up` never reuses it.
+pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+fn_group() { cat "$GRPF" 2>/dev/null || true; }
+group_alive() { [ -n "$1" ] && kill -s 0 -- "-$1" 2>/dev/null; }
+
+# Start serving in a new process group: setsid where it exists, otherwise python3 os.setsid then exec.
+fn_spawn() {
+  local args=(supabase functions serve --workdir "$(cd -P "$WD" && pwd -P)" --env-file "$ENVF")
+  rm -f "$GRPF"
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "${args[@]}" > "$LOGF" 2>&1 &
+  else
+    nohup python3 -c 'import os, sys
+try:
+    os.setsid()
+except OSError:
+    pass
+os.execvp(sys.argv[1], sys.argv[1:])' "${args[@]}" > "$LOGF" 2>&1 &
+  fi
+  local pid=$! n=0 g
+  echo "$pid" > "$PIDF"
+  # Until setsid has run the child still shares our group: wait for its own group id, and only call it
+  # gone when the process is really gone.
+  while [ "$n" -lt 50 ]; do
+    g="$(pgid_of "$pid")"
+    if [ "$g" = "$pid" ]; then echo "$g" > "$GRPF"; return 0; fi
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1; n=$((n + 1))
+  done
+}
+
+# TERM the whole group, wait, then KILL, and warn when processes are still there.
+fn_stop() {
+  local g n own
+  g="$(fn_group)"
+  own="$(pgid_of $$)"
+  if [ -n "$g" ] && [ "$g" != "$own" ] && [ "$g" -gt 1 ] 2>/dev/null; then
+    if group_alive "$g"; then
+      kill -s TERM -- "-$g" 2>/dev/null || true
+      n=0; while group_alive "$g" && [ "$n" -lt $(( ${TOOLING_STOP_WAIT:-10} * 5 )) ]; do sleep 0.2; n=$((n + 1)); done
+      if group_alive "$g"; then
+        kill -s KILL -- "-$g" 2>/dev/null || true
+        n=0; while group_alive "$g" && [ "$n" -lt 25 ]; do sleep 0.2; n=$((n + 1)); done
+        if group_alive "$g"; then echo "warning: processes of the functions group $g are still running" >&2; fi
+      fi
+    fi
+  elif fn_serving; then
+    kill "$(cat "$PIDF")" 2>/dev/null || true
+  fi
+  rm -f "$GRPF"
+}
 fn_answers() {
   local c; c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$(url)/functions/v1/${SUPABASE_FUNCTIONS_PROBE:-fn-version}" || true)"
   [ "$c" = 200 ]
@@ -202,10 +260,10 @@ functions_up() {
   running || die "stack not running (make local-up)"
   fn_stage
   if fn_serving && fn_answers; then fn_push_tree; echo "✓ local functions already serving (source refreshed)"; return 0; fi
-  if fn_serving; then kill "$(cat "$PIDF")" 2>/dev/null || true; fi
+  # Not serving, not answering, or a leaderless group left behind: stop whatever is there, start fresh.
+  fn_stop
   echo "→ serving $FN_SRC on the local edge runtime (fake secrets, no provider keys)…"
-  nohup supabase functions serve --workdir "$(cd -P "$WD" && pwd -P)" --env-file "$ENVF" > "$LOGF" 2>&1 &
-  echo $! > "$PIDF"
+  fn_spawn
   for _ in $(seq 1 60); do
     running_container "$EDGE" && grep -q "Serving functions" "$LOGF" 2>/dev/null && break
     fn_serving || { echo "✗ LOCAL: functions serve exited early, see $LOGF" >&2; tail -5 "$LOGF" >&2; exit 1; }
@@ -220,7 +278,7 @@ functions_up() {
 }
 
 functions_down() {
-  if fn_serving; then kill "$(cat "$PIDF")" 2>/dev/null || true; fi
+  fn_stop
   rm -f "$PIDF" "$ENVF"
   echo "✓ local functions stopped"
 }
@@ -246,7 +304,7 @@ case "${1:-}" in
     echo "✓ local stack up"
     ;;
   down)
-    functions_down >/dev/null 2>&1 || true
+    functions_down >/dev/null || true
     supabase stop --workdir "$WD" --no-backup || true
     rm -f "$GUARD_FILE"
     lock_release
@@ -268,6 +326,14 @@ case "${1:-}" in
     [ -n "$k" ] || die "no service-role key in 'supabase status'"
     echo "$k"
     ;;
+  db-url)
+    p="${SUPABASE_LOCAL_DB_PORT-54322}"
+    case "$p" in
+      ''|0*|*[!0-9]*) die "SUPABASE_LOCAL_DB_PORT '$p' is not a port (digits only, 1-65535, no leading zero)" ;;
+    esac
+    [ "${#p}" -le 5 ] && [ "$p" -le 65535 ] || die "SUPABASE_LOCAL_DB_PORT '$p' is out of range (1-65535)"
+    echo "postgresql://postgres:postgres@127.0.0.1:$p/postgres"
+    ;;
   container) echo "$DB" ;;
   guard-file) echo "$GUARD_FILE" ;;
   workdir) echo "$WD" ;;
@@ -276,7 +342,10 @@ case "${1:-}" in
   unlock) lock_release ;;
   functions-up) functions_up ;;
   functions-down) functions_down ;;
-  functions-status) if fn_serving; then echo "local functions serving (pid $(cat "$PIDF"))"; else echo "local functions not serving"; fi ;;
+  functions-status)
+    if fn_serving; then echo "local functions serving (pid $(cat "$PIDF"))"
+    elif group_alive "$(fn_group)"; then echo "local functions leaderless (group $(fn_group) still running; functions-down stops it)"
+    else echo "local functions not serving"; fi ;;
   admin-secret) sed -n 's/^ADMIN_SECRET=//p' "$ENVF" 2>/dev/null | head -1 ;;
   db)
     running || die "database container $DB is not running (make local-up)"
@@ -288,5 +357,5 @@ case "${1:-}" in
       *)  printf '%s\n' "$2" | "${PSQL[@]}" -q -f - ;;
     esac
     ;;
-  *) echo "usage: supabase-local <up|down|status|url|key|servicekey|container|guard-file|workdir|abs-workdir|lock|unlock|functions-up|functions-down|functions-status|admin-secret|db>" >&2; exit 1 ;;
+  *) echo "usage: supabase-local <up|down|status|url|key|servicekey|container|guard-file|workdir|abs-workdir|lock|unlock|functions-up|functions-down|functions-status|admin-secret|db|db-url>" >&2; exit 1 ;;
 esac
