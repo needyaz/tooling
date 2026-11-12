@@ -324,6 +324,8 @@ d="$(fixture always-pass)"; out="$(chk "$d")"; st=$?
 check "fails on an always-pass test target" "$([ $st -ne 0 ] && echo "$out" | grep -q "test-ui-surface" && echo 0 || echo 1)" "$out"
 d="$(fixture missing-target)"; out="$(chk "$d")"; st=$?
 check "fails on a missing footprint target" "$([ $st -ne 0 ] && echo "$out" | grep -q "'test-device'" && echo 0 || echo 1)" "$out"
+d="$(fixture non-phony)"; out="$(chk "$d")"; st=$?
+check "fails on a standard target not declared .PHONY (test/ folder fixture)" "$([ $st -ne 0 ] && echo "$out" | grep -q "target 'test' is not declared .PHONY" && ! echo "$out" | grep -q "'test-device' is not" && echo 0 || echo 1)" "$out"
 d="$(fixture clean)"; echo '# local edit' >> "$d/tooling/bin/logged"; out="$(chk "$d")"; st=$?
 check "fails on an edited vendored file, naming it" "$([ $st -ne 0 ] && echo "$out" | grep -q 'tooling/bin/logged was edited' && echo 0 || echo 1)" "$out"
 d="$(fixture clean)"; rm "$d/tooling/bin/ios-sim"; out="$(chk "$d")"; st=$?

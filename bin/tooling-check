@@ -5,6 +5,7 @@ Fails (exit 1) when
   - tooling/MANIFEST does not match the vendored files (edited, missing or extra file),
   - the Makefile does not include tooling/mk/tooling.mk,
   - a standard target required by a footprint in TOOLING_FOOTPRINTS is not defined,
+  - a defined standard target is not declared .PHONY (included makefiles count),
   - the recipe of a test* or standard target swallows failure (`|| true`, `|| :`, or a pipe into
     grep/tee/tail/head without pipefail or PIPESTATUS). A line ending in `# tooling: allow-soft` is exempt.
 """
@@ -103,9 +104,16 @@ def make_database(app):
     out = subprocess.run(["make", "-pRrq", "-f", "Makefile", "__tooling_none__"], cwd=app,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout
     targets = {}
+    phony = set()
     cur = None
     prev = ""
     for line in out.split("\n"):
+        pm = re.match(r"^\.PHONY:\s*(.*)$", line)
+        if pm:
+            phony.update(pm.group(1).split())
+            cur = None
+            prev = line
+            continue
         m = re.match(r"^([^\s#:=%.][^\s:=%]*):(?!=)\s*(.*)$", line)
         if m and prev != "# Not a target:":
             cur = targets.setdefault(m.group(1), {"recipe": [], "prereqs": ""})
@@ -118,7 +126,7 @@ def make_database(app):
         elif not line.startswith("#"):
             cur = None
         prev = line
-    return targets
+    return targets, phony
 
 
 def swallows(line):
@@ -132,7 +140,12 @@ def swallows(line):
 
 
 def check_targets(app, footprints):
-    targets = make_database(app)
+    targets, phony = make_database(app)
+    for name in STANDARD:
+        d = targets.get(name)
+        if d is not None and (d["recipe"] or d["prereqs"]) and name not in phony:
+            fail("target '%s' is not declared .PHONY (a file or folder named '%s' would make `make %s` "
+                 "say \"up to date\", run nothing and exit 0)" % (name, name, name))
     for fp in footprints:
         for t in REQUIRED.get(fp, []):
             d = targets.get(t)

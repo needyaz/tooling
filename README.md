@@ -115,6 +115,7 @@ Fails when:
 - `tooling/MANIFEST` does not match the vendored files (each edited, missing or extra file is named).
 - The Makefile does not include `tooling/mk/tooling.mk`.
 - A standard target required by a footprint is not defined. Targets are read with `make -pRrq`, which runs no recipe.
+- A defined standard target is not declared `.PHONY` (makefiles it includes count). With a `test/` folder, a non-phony `test:` makes `make test` say "up to date", run nothing and exit 0.
 - A `test*` or standard target swallows failure: its recipe has `|| true` or `|| :`, or pipes into `grep`, `tee`, `tail` or `head` on a line without `pipefail` or `PIPESTATUS`. A line ending in `# tooling: allow-soft` is exempt.
 
 ## Development
