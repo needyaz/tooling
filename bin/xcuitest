@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# xcuitest NAME -- XCODEBUILD-ARGS...
+# Runs `xcodebuild test ARGS` with the full output kept in a log (via logged), prints only the
+# Test Case / Test Suite / error: lines, and exits with xcodebuild's status. A run that executed no
+# tests fails, even when xcodebuild exited 0.
+set -u
+
+[ "$#" -ge 3 ] && [ "$2" = "--" ] || { echo "usage: xcuitest NAME -- XCODEBUILD-ARGS..." >&2; exit 2; }
+name="$1"; shift 2
+
+summary="$("$(dirname "$0")/logged" "$name" -- xcodebuild test "$@")"
+rc=$?
+log="${summary##* }"
+
+grep -E "^(Test Case|Test Suite)|error:" "$log" || true
+echo "$summary"
+
+if [ "$rc" -eq 0 ] && ! grep -Eq "Test Case .* (passed|failed)|Executed [1-9][0-9]* tests?|Test run with [1-9][0-9]* tests?" "$log"; then
+  echo "✗ $name: no tests executed ($log)" >&2
+  exit 1
+fi
+exit "$rc"

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# logged NAME -- CMD [ARGS...]
+# Runs CMD with all output in build/logs/NAME-<timestamp>-<pid>.log (never overwritten), prints one line
+#   ✓ NAME 12s build/logs/NAME-....log      (or ✗ on failure)
+# and exits with CMD's status.
+set -u
+
+[ "$#" -ge 3 ] && [ "$2" = "--" ] || { echo "usage: logged NAME -- CMD [ARGS...]" >&2; exit 2; }
+name="$1"; shift 2
+case "$name" in ''|*[!A-Za-z0-9._-]*) echo "logged: NAME may only use letters, digits, . _ -" >&2; exit 2 ;; esac
+
+dir="build/logs"
+mkdir -p "$dir" || exit 2
+base="$dir/$name-$(date +%Y%m%d-%H%M%S)-$$"
+log="$base.log"; n=1
+while [ -e "$log" ]; do n=$((n + 1)); log="$base-$n.log"; done
+: > "$log"
+
+start=$SECONDS
+"$@" > "$log" 2>&1
+rc=$?
+secs=$((SECONDS - start))
+
+if [ "$rc" -eq 0 ]; then mark="✓"; else mark="✗"; fi
+echo "$mark $name ${secs}s $log"
+exit "$rc"

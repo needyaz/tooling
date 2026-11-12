@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""tooling-check [APP_DIR]: check that an app meets the tooling contract (see tooling/README.md).
+
+Fails (exit 1) when
+  - tooling/MANIFEST does not match the vendored files (edited, missing or extra file),
+  - the Makefile does not include tooling/mk/tooling.mk,
+  - a standard target required by a footprint in TOOLING_FOOTPRINTS is not defined,
+  - the recipe of a test* or standard target swallows failure (`|| true`, `|| :`, or a pipe into
+    grep/tee/tail/head without pipefail or PIPESTATUS). A line ending in `# tooling: allow-soft` is exempt.
+"""
+import hashlib
+import os
+import re
+import subprocess
+import sys
+
+REQUIRED = {
+    "flutter": ["test", "test-device"],
+    "supabase": ["local-up", "local-down"],
+}
+STANDARD = ["setup", "test", "test-device", "local-up", "local-down", "screenshots", "listing",
+            "beta", "release", "deploy-backend"]
+ALLOW = "# tooling: allow-soft"
+
+problems = []
+
+
+def fail(msg):
+    problems.append(msg)
+
+
+def read_env(path):
+    env = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v
+    return env
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_manifest(app):
+    tdir = os.path.join(app, "tooling")
+    mpath = os.path.join(tdir, "MANIFEST")
+    if not os.path.isfile(mpath):
+        fail("tooling/MANIFEST is missing (vendor with tooling-sync)")
+        return None
+    expected = {}
+    with open(mpath, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            digest, _, rel = line.partition("  ")
+            expected[rel] = digest
+    actual = {}
+    for root, _, files in os.walk(tdir):
+        for name in files:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, tdir)
+            if rel != "MANIFEST":
+                actual[rel] = full
+    for rel in sorted(expected):
+        if rel not in actual:
+            fail("tooling/%s is missing" % rel)
+        elif sha256(actual[rel]) != expected[rel]:
+            fail("tooling/%s was edited (does not match MANIFEST)" % rel)
+    for rel in sorted(actual):
+        if rel not in expected:
+            fail("tooling/%s is not part of the vendored files (extra)" % rel)
+    vpath = os.path.join(tdir, "VERSION")
+    if os.path.isfile(vpath):
+        with open(vpath) as f:
+            return f.read().strip()
+    return None
+
+
+def check_include(app):
+    mk = os.path.join(app, "Makefile")
+    if not os.path.isfile(mk):
+        fail("no Makefile")
+        return False
+    with open(mk, encoding="utf-8") as f:
+        for line in f:
+            if re.match(r"\s*-?include\s+.*tooling/mk/tooling\.mk", line):
+                return True
+    fail("Makefile does not include tooling/mk/tooling.mk")
+    return False
+
+
+def make_database(app):
+    """Parse `make -p` into {target: {"recipe": [logical lines], "prereqs": str}} without running recipes."""
+    out = subprocess.run(["make", "-pRrq", "-f", "Makefile", "__tooling_none__"], cwd=app,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+    targets = {}
+    cur = None
+    prev = ""
+    for line in out.split("\n"):
+        m = re.match(r"^([^\s#:=%.][^\s:=%]*):(?!=)\s*(.*)$", line)
+        if m and prev != "# Not a target:":
+            cur = targets.setdefault(m.group(1), {"recipe": [], "prereqs": ""})
+            cur["prereqs"] = (cur["prereqs"] + " " + m.group(2)).strip()
+        elif line.startswith("\t") and cur is not None:
+            if cur["recipe"] and cur["recipe"][-1].endswith("\\"):
+                cur["recipe"][-1] += " " + line.strip()
+            else:
+                cur["recipe"].append(line.strip())
+        elif not line.startswith("#"):
+            cur = None
+        prev = line
+    return targets
+
+
+def swallows(line):
+    if ALLOW in line:
+        return None
+    if re.search(r"\|\|\s*(true|:)(\s|;|\)|$)", line):
+        return "has '|| true' / '|| :'"
+    if re.search(r"(?<!\|)\|(?!\|)\s*(grep|tee|tail|head)\b", line) and not re.search(r"pipefail|PIPESTATUS", line):
+        return "pipes into grep/tee/tail/head without pipefail or PIPESTATUS"
+    return None
+
+
+def check_targets(app, footprints):
+    targets = make_database(app)
+    for fp in footprints:
+        for t in REQUIRED.get(fp, []):
+            d = targets.get(t)
+            if d is None or not (d["recipe"] or d["prereqs"]):
+                fail("target '%s' (required by footprint '%s') is not defined" % (t, fp))
+    for name, d in sorted(targets.items()):
+        if not (name.startswith("test") or name in STANDARD):
+            continue
+        for line in d["recipe"]:
+            why = swallows(line)
+            if why:
+                fail("target '%s' swallows failure: %s: %s" % (name, why, line))
+
+
+def main():
+    app = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
+    envp = os.path.join(app, "tooling.env")
+    env = {}
+    if os.path.isfile(envp):
+        env = read_env(envp)
+    else:
+        fail("tooling.env is missing")
+    footprints = env.get("TOOLING_FOOTPRINTS", "").split()
+    if os.path.isfile(envp) and not footprints:
+        fail("TOOLING_FOOTPRINTS is empty in tooling.env")
+    version = check_manifest(app)
+    if check_include(app):
+        check_targets(app, footprints)
+    for fp in footprints:
+        if fp not in REQUIRED:
+            print("note: footprint '%s' has no checks in this version" % fp)
+    if problems:
+        for p in problems:
+            print("✗ " + p)
+        print("tooling-check: %d problem(s)" % len(problems))
+        return 1
+    print("✓ tooling-check passed (tooling %s, footprints: %s)" % (version or "?", " ".join(footprints)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

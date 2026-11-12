@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+#
+# The disposable LOCAL Supabase stack for an app: lifecycle, facts, edge functions and SQL.
+#
+#   supabase-local up             start the stack (no schema, boot migrations off), arm the per-run guard
+#   supabase-local down           stop functions and the stack, drop its data, release the lock
+#   supabase-local status         one line: running / not running
+#   supabase-local url            the API URL (refuses anything but loopback)
+#   supabase-local key            the publishable/anon key (read from `supabase status`, never stored)
+#   supabase-local servicekey     the local service-role key (same source)
+#   supabase-local container      the database container name
+#   supabase-local guard-file     the per-run guard value file (relative to the app root)
+#   supabase-local workdir        the generated work dir (relative)
+#   supabase-local abs-workdir    its physical absolute path (no symlink components)
+#   supabase-local lock|unlock    take / release the machine-wide stack lock
+#   supabase-local functions-up   serve the app's edge functions with fake per-run secrets (idempotent)
+#   supabase-local functions-down stop serving them
+#   supabase-local functions-status
+#   supabase-local admin-secret   the per-run fake ADMIN_SECRET (empty if functions are not staged)
+#   supabase-local db -f FILE     run a multi-statement SQL file in the local database
+#   supabase-local db "SQL"       run one statement
+#
+# Configuration: KEY=VALUE lines in the app's tooling.env (no quotes), overridden by the environment.
+#   SUPABASE_LOCAL_ID          stack name, used in container names (default: <app dir name>-local)
+#   SUPABASE_LOCAL_URL         API URL, loopback only (default http://127.0.0.1:54321)
+#   SUPABASE_FUNCTIONS_SRC     edge functions directory (default supabase/functions)
+#   SUPABASE_NO_JWT_FUNCTIONS  space-separated functions served without JWT verification
+#   SUPABASE_FUNCTIONS_PROBE   function polled until it answers 200 (default fn-version)
+#   SUPABASE_LOCAL_EXCLUDE     services not started (default: studio,imgproxy,mailpit,logflare,vector,postgres-meta)
+#   SUPABASE_LOCAL_AFTER_UP    a command run after `up` (for example the app's guard seeding)
+#   TOOLING_LOCK_DIR           where machine-wide locks live (default ~/.cache/tooling/locks)
+#   TOOLING_LOCK_TIMEOUT       seconds to wait for the stack lock (default 900)
+#   TOOLING_LOCK_INTERVAL      seconds between retries (default 5)
+#   TOOLING_LOCK_STALE_AFTER   seconds before a lock whose container is not running counts as stale (default 300)
+#
+# Why a generated work dir: `supabase start` applies supabase/migrations/ at boot. When those are deltas
+# on top of a baseline, the first one fails on an empty database. Turning boot migrations off needs
+# `[db.migrations] enabled = false`, and supabase/config.toml is also what `supabase config push` sends to
+# remote projects, so the switch lives in a generated copy and config.toml is never touched.
+#
+# One stack at a time: every local stack publishes the same default ports, so each holds a machine-wide
+# lock for its whole life. A lock whose stack's database container is no longer running is stale and is
+# broken. Nothing here links, logs in or reaches a remote project.
+set -euo pipefail
+
+# Physical (symlink-free) app root: the Docker runtime mounts physical paths.
+ROOT="${TOOLING_APP_ROOT:-$(cd -P "$(dirname "$0")/../.." && pwd -P)}"
+cd -P "$ROOT"
+
+# tooling.env: plain KEY=VALUE lines; the environment wins.
+if [ -f tooling.env ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"; v="${line#*=}"
+    k="$(printf '%s' "$k" | tr -d '[:space:]')"
+    case "$k" in *[!A-Za-z0-9_]*|'') continue ;; esac
+    [ -n "${!k+x}" ] || export "$k=$v"
+  done < tooling.env
+fi
+
+PID="${SUPABASE_LOCAL_ID:-$(basename "$ROOT")-local}"
+WD="build/local-supabase"
+DB="supabase_db_${PID}"
+EDGE="supabase_edge_runtime_${PID}"
+EXCLUDE="${SUPABASE_LOCAL_EXCLUDE:-studio,imgproxy,mailpit,logflare,vector,postgres-meta}"
+GUARD_FILE="$WD/guard"
+FN_SRC="${SUPABASE_FUNCTIONS_SRC:-supabase/functions}"
+FN_DIR="$WD/supabase/functions"
+ENVF="$WD/functions.env"
+PIDF="$WD/functions.pid"
+LOGF="$WD/functions.log"
+
+LOCK="${TOOLING_LOCK_DIR:-$HOME/.cache/tooling/locks}/supabase-stack.lock"
+OWNER="$PID"
+
+die() { echo "✗ LOCAL: $*" >&2; exit 1; }
+
+running_container() { docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -qx true; }
+running() { running_container "$DB"; }
+
+# --- lock -------------------------------------------------------------------------------------------
+# A directory (atomic mkdir) holding `owner` (the stack name) and `container` (its database container).
+lock_owner() { cat "$LOCK/owner" 2>/dev/null || echo "unknown owner"; }
+lock_mine() { [ -f "$LOCK/owner" ] && [ "$(cat "$LOCK/owner" 2>/dev/null)" = "$OWNER" ]; }
+
+# Stale: the holder's container is not running and the lock is older than a starting stack needs.
+lock_stale() {
+  local c age
+  c="$(cat "$LOCK/container" 2>/dev/null || true)"
+  [ -n "$c" ] || return 1
+  running_container "$c" && return 1
+  age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
+  [ "$age" -ge "${TOOLING_LOCK_STALE_AFTER:-300}" ]
+}
+
+lock_acquire() {
+  local timeout="${TOOLING_LOCK_TIMEOUT:-900}" interval="${TOOLING_LOCK_INTERVAL:-5}" waited=0
+  mkdir -p "$(dirname "$LOCK")"
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    if lock_mine; then return 0; fi
+    if lock_stale; then
+      echo "… breaking a stale stack lock held by $(lock_owner) (its container is not running)" >&2
+      rm -f "$LOCK/owner" "$LOCK/container"; rmdir "$LOCK" 2>/dev/null || true
+      continue
+    fi
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "✗ LOCAL: another Supabase stack still holds $LOCK after ${timeout}s ($(lock_owner)). Stop it with its 'make local-down'." >&2
+      return 1
+    fi
+    echo "… waiting for the machine-wide Supabase stack lock ($(lock_owner) holds $LOCK), retrying every ${interval}s" >&2
+    sleep "$interval"; waited=$((waited + interval))
+  done
+  printf '%s\n' "$OWNER" > "$LOCK/owner"
+  printf '%s\n' "$DB" > "$LOCK/container"
+}
+
+lock_release() { if lock_mine; then rm -f "$LOCK/owner" "$LOCK/container"; rmdir "$LOCK" 2>/dev/null || true; fi; }
+
+# --- facts ------------------------------------------------------------------------------------------
+check_loopback() {
+  local rest
+  case "$1" in
+    http://127.0.0.1:*) rest="${1#http://127.0.0.1:}" ;;
+    http://localhost:*) rest="${1#http://localhost:}" ;;
+    *) die "refusing non-loopback URL '$1' (the local stack only talks to 127.0.0.1/localhost)" ;;
+  esac
+  rest="${rest%/}"
+  case "$rest" in
+    ''|*[!0-9]*) die "refusing URL '$1' (expected http://127.0.0.1:PORT or http://localhost:PORT)" ;;
+  esac
+}
+
+url() { local u="${SUPABASE_LOCAL_URL:-http://127.0.0.1:54321}"; check_loopback "$u"; echo "$u"; }
+
+port_bound() { local port; port="$(url | sed 's/.*://; s,/$,,')"; (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; }
+
+status_env() { supabase status --workdir "$WD" -o env 2>/dev/null; }
+
+write_config() {
+  [ -f supabase/config.toml ] || die "no supabase/config.toml in $ROOT"
+  mkdir -p "$WD/supabase"
+  {
+    echo "project_id = \"$PID\""
+    echo
+    awk '
+      /^project_id[[:space:]]*=/ { next }
+      /^\[db\.migrations\]/ { skip = 1; next }
+      /^\[/ { skip = 0 }
+      !skip { print }
+    ' supabase/config.toml
+    echo
+    echo "[db.migrations]"
+    echo "enabled = false"
+  } > "$WD/supabase/config.toml"
+}
+
+# Per-run guard: a random value in a 0600 file. An app can compare its digest against one stored in the
+# database so a command meant for this stack cannot run against another.
+arm_guard() { ( umask 077; [ -s "$GUARD_FILE" ] || od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$GUARD_FILE" ); }
+
+# --- functions --------------------------------------------------------------------------------------
+fn_serving() { [ -s "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+fn_answers() {
+  local c; c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$(url)/functions/v1/${SUPABASE_FUNCTIONS_PROBE:-fn-version}" || true)"
+  [ "$c" = 200 ]
+}
+
+# The runtime bind-mounts the functions dir read-only by host path, and a Docker VM may not share that
+# host path, so the mount can come up empty. Copy the staged tree into the VM directory through a
+# throwaway container created (never started) from the runtime's own cached image.
+fn_push_tree() {
+  local img stg abs
+  abs="$(cd -P "$WD" && pwd -P)"
+  img="$(docker inspect -f '{{.Config.Image}}' "$EDGE")"
+  stg="${PID}-fn-stage-$$"
+  docker create --name "$stg" -v "$abs/supabase/functions:/dst" "$img" true >/dev/null
+  docker cp "$FN_DIR/." "$stg:/dst/"
+  docker rm "$stg" >/dev/null
+}
+
+# Fake secrets only: FN_VERSION and a random ADMIN_SECRET. Provider secrets stay unset so a function that
+# needs one fails closed and never reaches the provider.
+fn_stage() {
+  [ -d "$FN_SRC" ] || die "no functions directory $FN_SRC (set SUPABASE_FUNCTIONS_SRC)"
+  mkdir -p "$FN_DIR"
+  cp -R "$FN_SRC/." "$FN_DIR/"
+  (
+    umask 077
+    {
+      echo "FN_VERSION=$(git rev-parse --short "HEAD:$FN_SRC" 2>/dev/null || echo local)"
+      echo "ADMIN_SECRET=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+    } > "$ENVF"
+  )
+  local cfg="$WD/supabase/config.toml"
+  awk '/^\[functions\./ { skip = 1; next } /^\[/ { skip = 0 } !skip { print }' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+  for f in ${SUPABASE_NO_JWT_FUNCTIONS:-}; do
+    printf '\n[functions.%s]\nverify_jwt = false\n' "$f" >> "$cfg"
+  done
+}
+
+functions_up() {
+  running || die "stack not running (make local-up)"
+  fn_stage
+  if fn_serving && fn_answers; then fn_push_tree; echo "✓ local functions already serving (source refreshed)"; return 0; fi
+  if fn_serving; then kill "$(cat "$PIDF")" 2>/dev/null || true; fi
+  echo "→ serving $FN_SRC on the local edge runtime (fake secrets, no provider keys)…"
+  nohup supabase functions serve --workdir "$(cd -P "$WD" && pwd -P)" --env-file "$ENVF" > "$LOGF" 2>&1 &
+  echo $! > "$PIDF"
+  for _ in $(seq 1 60); do
+    running_container "$EDGE" && grep -q "Serving functions" "$LOGF" 2>/dev/null && break
+    fn_serving || { echo "✗ LOCAL: functions serve exited early, see $LOGF" >&2; tail -5 "$LOGF" >&2; exit 1; }
+    sleep 1
+  done
+  fn_push_tree
+  for _ in $(seq 1 60); do
+    fn_answers && { echo "✓ local functions serving at $(url)/functions/v1/"; return 0; }
+    sleep 1
+  done
+  echo "✗ LOCAL: ${SUPABASE_FUNCTIONS_PROBE:-fn-version} did not answer 200, see $LOGF" >&2; tail -8 "$LOGF" >&2; exit 1
+}
+
+functions_down() {
+  if fn_serving; then kill "$(cat "$PIDF")" 2>/dev/null || true; fi
+  rm -f "$PIDF" "$ENVF"
+  echo "✓ local functions stopped"
+}
+
+# --- commands ---------------------------------------------------------------------------------------
+case "${1:-}" in
+  up)
+    command -v docker >/dev/null || die "docker not found"
+    lock_acquire || exit 1
+    if ! running && port_bound; then
+      lock_release
+      die "port $(url | sed 's/.*://; s,/$,,') is already bound by something that is not this stack, stop it first"
+    fi
+    write_config
+    if running; then
+      echo "✓ local stack already running ($DB)"
+    else
+      echo "→ starting local Supabase ($PID, no schema, boot migrations off)…"
+      supabase start --workdir "$WD" -x "$EXCLUDE" || { lock_release; exit 1; }
+    fi
+    arm_guard
+    if [ -n "${SUPABASE_LOCAL_AFTER_UP:-}" ]; then sh -c "$SUPABASE_LOCAL_AFTER_UP"; fi
+    echo "✓ local stack up"
+    ;;
+  down)
+    functions_down >/dev/null 2>&1 || true
+    supabase stop --workdir "$WD" --no-backup || true
+    rm -f "$GUARD_FILE"
+    lock_release
+    echo "✓ local stack stopped (data dropped, guard discarded, lock released)"
+    ;;
+  status) if running; then echo "local stack running ($DB)"; else echo "local stack not running"; fi ;;
+  url) url ;;
+  key)
+    running || die "stack not running (make local-up)"
+    out="$(status_env)"
+    k="$(printf '%s\n' "$out" | sed -n 's/^PUBLISHABLE_KEY="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1)"
+    [ -n "$k" ] || k="$(printf '%s\n' "$out" | sed -n 's/^ANON_KEY="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1)"
+    [ -n "$k" ] || die "no publishable/anon key in 'supabase status'"
+    echo "$k"
+    ;;
+  servicekey)
+    running || die "stack not running (make local-up)"
+    k="$(status_env | sed -n 's/^SERVICE_ROLE_KEY="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1)"
+    [ -n "$k" ] || die "no service-role key in 'supabase status'"
+    echo "$k"
+    ;;
+  container) echo "$DB" ;;
+  guard-file) echo "$GUARD_FILE" ;;
+  workdir) echo "$WD" ;;
+  abs-workdir) mkdir -p "$WD" && (cd -P "$WD" && pwd -P) ;;
+  lock) lock_acquire ;;
+  unlock) lock_release ;;
+  functions-up) functions_up ;;
+  functions-down) functions_down ;;
+  functions-status) if fn_serving; then echo "local functions serving (pid $(cat "$PIDF"))"; else echo "local functions not serving"; fi ;;
+  admin-secret) sed -n 's/^ADMIN_SECRET=//p' "$ENVF" 2>/dev/null | head -1 ;;
+  db)
+    running || die "database container $DB is not running (make local-up)"
+    PSQL=(docker exec -i "$DB" psql -U postgres -d postgres -v ON_ERROR_STOP=1)
+    case "${2:-}" in
+      -f) f="${3:?usage: supabase-local db -f FILE}"; [ -f "$f" ] || die "no such file: $f"
+          "${PSQL[@]}" -q -f - < "$f" ;;
+      "") echo 'usage: supabase-local db -f FILE | "SQL"' >&2; exit 1 ;;
+      *)  printf '%s\n' "$2" | "${PSQL[@]}" -q -f - ;;
+    esac
+    ;;
+  *) echo "usage: supabase-local <up|down|status|url|key|servicekey|container|guard-file|workdir|abs-workdir|lock|unlock|functions-up|functions-down|functions-status|admin-secret|db>" >&2; exit 1 ;;
+esac

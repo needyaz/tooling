@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# ios-sim: print the UDID of an iOS simulator to use.
+#   1. $SIM_UDID, if set
+#   2. the device named $IOS_SIM_DEVICE (booted as is, otherwise booted here and waited for)
+#   3. the first booted iOS simulator
+# Anything else is an error. IOS_SIM_DEVICE may also be set in the app's tooling.env.
+set -euo pipefail
+
+ROOT="${TOOLING_APP_ROOT:-$(cd -P "$(dirname "$0")/../.." && pwd -P)}"
+if [ -f "$ROOT/tooling.env" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"; v="${line#*=}"
+    k="$(printf '%s' "$k" | tr -d '[:space:]')"
+    case "$k" in *[!A-Za-z0-9_]*|'') continue ;; esac
+    [ -n "${!k+x}" ] || export "$k=$v"
+  done < "$ROOT/tooling.env"
+fi
+
+if [ -n "${SIM_UDID:-}" ]; then echo "$SIM_UDID"; exit 0; fi
+
+command -v xcrun >/dev/null || { echo "✗ ios-sim: xcrun not found" >&2; exit 1; }
+
+# Prints "UDID STATE" for the wanted device, or for every booted iOS simulator when no name is given.
+# Among same-named devices a booted one wins, then the newest runtime.
+pick() {
+  xcrun simctl list devices available -j | python3 -I -c '
+import json, sys
+name = sys.argv[1]
+data = json.load(sys.stdin)["devices"]
+rows = []
+for runtime in sorted(data):
+    if "iOS" not in runtime:
+        continue
+    for d in data[runtime]:
+        if d.get("isAvailable", True) is False:
+            continue
+        rows.append((d["name"], d["udid"], d["state"]))
+if name:
+    rows = [r for r in rows if r[0] == name]
+    rows.sort(key=lambda r: r[2] != "Booted")
+    rows = rows[:1]
+else:
+    rows = [r for r in rows if r[2] == "Booted"][:1]
+for _, udid, state in rows:
+    print(udid, state)
+' "$1"
+}
+
+if [ -n "${IOS_SIM_DEVICE:-}" ]; then
+  row="$(pick "$IOS_SIM_DEVICE")"
+  [ -n "$row" ] || { echo "✗ ios-sim: no iOS simulator named '$IOS_SIM_DEVICE'" >&2; exit 1; }
+  udid="${row%% *}"; state="${row#* }"
+  if [ "$state" != "Booted" ]; then
+    xcrun simctl boot "$udid" >&2 || true
+    xcrun simctl bootstatus "$udid" >&2 || { echo "✗ ios-sim: '$IOS_SIM_DEVICE' did not boot" >&2; exit 1; }
+  fi
+  echo "$udid"
+  exit 0
+fi
+
+row="$(pick "")"
+[ -n "$row" ] || { echo "✗ ios-sim: no booted iOS simulator (set SIM_UDID or IOS_SIM_DEVICE)" >&2; exit 1; }
+echo "${row%% *}"

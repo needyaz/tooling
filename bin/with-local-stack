@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# with-local-stack [--functions] -- CMD [ARGS...]
+# Starts the local stack, runs CMD, always stops the stack (also on error, Ctrl-C and TERM), and exits
+# with CMD's status.
+set -u
+
+SL="${TOOLING_SUPABASE_LOCAL:-$(dirname "$0")/supabase-local}"
+fn=0
+if [ "${1:-}" = "--functions" ]; then fn=1; shift; fi
+[ "${1:-}" = "--" ] || { echo "usage: with-local-stack [--functions] -- CMD [ARGS...]" >&2; exit 2; }
+shift
+[ "$#" -gt 0 ] || { echo "usage: with-local-stack [--functions] -- CMD [ARGS...]" >&2; exit 2; }
+
+rc=1
+cleanup() {
+  trap - EXIT INT TERM
+  "$SL" down || true
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'rc=130; exit' INT
+trap 'rc=143; exit' TERM
+
+if "$SL" up && { [ "$fn" = 0 ] || "$SL" functions-up; }; then
+  "$@"
+  rc=$?
+else
+  rc=$?
+fi
+exit "$rc"
