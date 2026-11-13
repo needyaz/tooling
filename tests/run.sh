@@ -345,6 +345,24 @@ check "a bare make starts nothing (default goal is tooling-help)" "$([ $st -eq 0
 d="$(fixture clean)"; { echo '.DEFAULT_GOAL := test'; cat "$d/Makefile"; } > "$d/M" && mv "$d/M" "$d/Makefile"; : > "$STUB_LOG"
 out="$(cd "$d" && make 2>&1)"
 check "a default goal set by the app before the include is kept" "$(echo "$out" | grep -q 'flutter test' && [ ! -s "$STUB_LOG" ] && echo 0 || echo 1)" "$out"
+d="$(fixture clean)"; : > "$STUB_LOG"
+out="$(cd "$d" && SIM_UDID=SIMX make test-ui-extra 2>&1)"; st=$?
+check "test-ui-extra with no ids passes and runs nothing" "$([ $st -eq 0 ] && echo "$out" | grep -q 'no extra UI tests' && ! grep -q '^xcodebuild' "$STUB_LOG" && echo 0 || echo 1)" "$out"
+: > "$STUB_LOG"
+out="$(cd "$d" && SIM_UDID=SIMX make test-ui-extra EXTRA_UI_TESTS="RunnerUITests/AUITests RunnerUITests/BUITests/testOne" 2>&1)"; st=$?
+runs="$(grep -c '^xcodebuild' "$STUB_LOG")"
+check "test-ui-extra runs one xcodebuild per id with the right arguments" \
+  "$([ $st -eq 0 ] && [ "$runs" = 2 ] && grep '^xcodebuild' "$STUB_LOG" | sed -n 1p | grep -q -- '-workspace ios/Runner.xcworkspace -scheme Runner -destination id=SIMX -only-testing:RunnerUITests/AUITests$' && grep '^xcodebuild' "$STUB_LOG" | sed -n 2p | grep -q -- '-only-testing:RunnerUITests/BUITests/testOne$' && echo 0 || echo 1)" "$out
+$(cat "$STUB_LOG")"
+: > "$STUB_LOG"
+out="$(cd "$d" && SIM_UDID=SIMX make test-ui-extra EXTRA_UI_TESTS="A/B" IOS_WORKSPACE="ios/My App.xcworkspace" IOS_SCHEME=S 2>&1)"
+check "test-ui-extra takes IOS_WORKSPACE and IOS_SCHEME" "$(grep -q -- '-workspace ios/My App.xcworkspace -scheme S ' "$STUB_LOG" && echo 0 || echo 1)" "$(cat "$STUB_LOG")"
+BADIDS=("R/A;touch $T/pwned" "R/A\`touch $T/pwned\`" "R/A&&touch $T/pwned" "R/A'B" 'A' 'A/B/C/D' 'A//B' '/A/B' 'A/B/' 'A/B C')
+for bad in "${BADIDS[@]}"; do
+  : > "$STUB_LOG"
+  out="$(cd "$d" && SIM_UDID=SIMX make test-ui-extra EXTRA_UI_TESTS="$bad" 2>&1)"; st=$?
+  check "test-ui-extra refuses id '$bad' before running anything" "$([ $st -ne 0 ] && echo "$out" | grep -q 'invalid test id' && ! grep -q '^xcodebuild' "$STUB_LOG" && [ ! -e "$T/pwned" ] && echo 0 || echo 1)" "$out"
+done
 d="$(fixture clean)"; out="$(cd "$d" && make tooling-version)"
 check "make tooling-version prints the vendored version" "$([ "$out" = "$(cat "$REPO/VERSION")" ] && echo 0 || echo 1)" "$out"
 d="$(fixture clean)"; out="$(cd "$d" && make local-functions ENV=prod 2>&1)"; st=$?

@@ -79,6 +79,23 @@ test-device:
 
 A bare `make` starts nothing: unless the app sets `.DEFAULT_GOAL` (before or after the include), the default goal is `tooling-help`.
 
+### Extra UI tests (`ios` and `flutter` footprints)
+
+`mk/ios.mk` (included when the footprints have `ios` or `flutter`) defines `test-ui-extra`. For each id in `EXTRA_UI_TESTS` (space-separated `Target/Class` or `Target/Class/method`, for example `RunnerUITests/AboutUITests`) it runs `bin/xcuitest ui-extra -- -workspace $IOS_WORKSPACE -scheme $IOS_SCHEME -destination id=<ios-sim> -only-testing:<id>`, one run and one log per id. New UI test classes therefore run without the app editing a fixed `-only-testing` list. With no ids it prints `no extra UI tests` and passes.
+
+| Key | Meaning |
+|---|---|
+| `EXTRA_UI_TESTS` | Ids to run (default empty) |
+| `IOS_WORKSPACE` | Default `ios/Runner.xcworkspace` |
+| `IOS_SCHEME` | Default `Runner` |
+
+Every id must match `^[A-Za-z0-9_]+(/[A-Za-z0-9_]+){1,2}$`; anything else fails before any test runs. Call it from inside the app's stack-wrapped `test-device` recipe so the tests get the local stack (use a literal `make`, not `$(MAKE)`):
+
+```make
+test-device:
+	tooling/bin/with-local-stack -- sh -c 'run-the-fixed-tests && make test-ui-extra'
+```
+
 ## Vendoring
 
 ```

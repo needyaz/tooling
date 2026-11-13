@@ -12,6 +12,10 @@ ifeq ($(.DEFAULT_GOAL),)
 .DEFAULT_GOAL := tooling-help
 endif
 
+ifneq ($(filter ios flutter,$(TOOLING_FOOTPRINTS)),)
+include $(TOOLING_DIR)/mk/ios.mk
+endif
+
 ifneq ($(filter supabase,$(TOOLING_FOOTPRINTS)),)
 include $(TOOLING_DIR)/mk/supabase-local.mk
 endif
