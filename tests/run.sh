@@ -53,6 +53,7 @@ echo "NOISE compiling"
 case "${XCB_MODE:-ok}" in
   ok)   echo "Test Suite 'All tests' started"; echo "Test Case '-[A t1]' passed"; exit 0 ;;
   fail) echo "Test Case '-[A t1]' failed"; echo "x.swift:1: error: boom"; exit 65 ;;
+  clone) echo "Test Suite 'RunnerTests' started on 'Clone 1 of iPhone 17 Pro'"; echo "Test case 'RunnerTests.testExample()' passed on 'Clone 1 of iPhone 17 Pro' (0.001 seconds)"; exit 0 ;;
   zero) echo "Executed 0 tests, with 0 failures"; exit 0 ;;
 esac
 EOF
@@ -240,6 +241,8 @@ check "fails a run that executed 0 tests" "$([ $st -ne 0 ] && echo "$out" | grep
 out="$(cd "$T/xc" && XCB_MODE=ok "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?
 check "passes a run with passing tests" "$([ $st -eq 0 ] && echo 0 || echo 1)" "$out"
 
+out="$(cd "$T/xc" && XCB_MODE=clone "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?
+check "a run on a cloned simulator (lowercase 'Test case ... passed on') counts as tests executed" "$([ $st -eq 0 ] && echo "$out" | grep -q "^Test case 'RunnerTests.testExample()' passed on 'Clone 1" && echo 0 || echo 1)" "$out"
 mkdir -p "$T/xcf"; echo 'TOOLING_FOOTPRINTS=flutter' > "$T/xcf/tooling.env"
 : > "$STUB_LOG"
 out="$(cd "$T/xcf" && TOOLING_APP_ROOT="$T/xcf" "$REPO/bin/xcuitest" ui -- -scheme S 2>&1)"; st=$?

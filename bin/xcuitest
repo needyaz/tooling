@@ -38,10 +38,10 @@ summary="$("$(dirname "$0")/logged" "$name" -- xcodebuild test "$@")"
 rc=$?
 log="${summary##* }"
 
-grep -E "^(Test Case|Test Suite)|error:" "$log" || true
+grep -Ei "^(Test Case|Test Suite)|error:" "$log" || true
 echo "$summary"
 
-if [ "$rc" -eq 0 ] && ! grep -Eq "Test Case .* (passed|failed)|Executed [1-9][0-9]* tests?|Test run with [1-9][0-9]* tests?" "$log"; then
+if [ "$rc" -eq 0 ] && ! grep -Eiq "Test Case .* (passed|failed)|Executed [1-9][0-9]* tests?|Test run with [1-9][0-9]* tests?" "$log"; then
   echo "✗ $name: no tests executed ($log)" >&2
   exit 1
 fi
