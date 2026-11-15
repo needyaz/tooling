@@ -117,6 +117,20 @@ check "held by a running stack: waits, then refuses naming the holder" \
   "$([ $st -ne 0 ] && echo "$out" | grep -q 'waiting' && echo "$out" | grep -q 'other' && echo 0 || echo 1)" "$out"
 check "the holder keeps the lock" "$([ "$(cat "$LOCK/owner")" = other ] && echo 0 || echo 1)"
 
+reset_stack; holder other yes
+echo 4242 > "$LOCK/pid"; echo "make test-device" > "$LOCK/cmd"; echo /some/cwd > "$LOCK/cwd"
+out="$(TOOLING_LOCK_TIMEOUT=5 TOOLING_LOCK_INTERVAL=1 TOOLING_LOCK_NOTICE_EVERY=2 SL lock 2>&1)"; st=$?
+check "waiting prints at the start, then every NOTICE_EVERY seconds, naming the holder" \
+  "$([ "$(echo "$out" | grep -c '^… waiting for the Supabase stack lock')" = 3 ] && echo "$out" | grep -q 'held by pid 4242 (stack other): make test-device in /some/cwd) 0 s' && echo "$out" | grep -q ') 4 s' && echo 0 || echo 1)" "$out"
+check "giving up names the holder and the time waited" "$([ $st -ne 0 ] && echo "$out" | grep -q 'gave up waiting.*after 5 s (held by pid 4242' && echo 0 || echo 1)" "$out"
+out="$(env -u TOOLING_LOCK_TIMEOUT TOOLING_LOCK_INTERVAL=1 TOOLING_LOCK_NOTICE_EVERY=1000 SL lock 2>&1 & sleep 1.5; kill $! 2>/dev/null; wait 2>/dev/null)"
+check "a single notice line when the wait starts (default notice interval)" "$([ "$(echo "$out" | grep -c 'waiting for')" -le 1 ] && echo 0 || echo 1)" "$out"
+holder other yes
+SL lock >/dev/null 2>&1; rm -rf "$LOCK"; SL lock >/dev/null 2>&1
+check "taking the lock records pid, command and directory" "$([ -s "$LOCK/pid" ] && [ "$(cat "$LOCK/cwd")" = "$APP" ] && [ -f "$LOCK/cmd" ] && echo 0 || echo 1)"
+SL unlock >/dev/null 2>&1
+check "unlock removes the whole lock directory" "$([ ! -e "$LOCK" ] && echo 0 || echo 1)"
+
 reset_stack; holder other no 200001010000
 out="$(SL lock 2>&1)"; st=$?
 check "stopped container and old lock: broken and taken" \

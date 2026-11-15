@@ -32,7 +32,8 @@
 #   SUPABASE_LOCAL_EXCLUDE     services not started (default: studio,imgproxy,mailpit,logflare,vector,postgres-meta)
 #   SUPABASE_LOCAL_AFTER_UP    a command run after `up` (for example the app's guard seeding)
 #   TOOLING_LOCK_DIR           where machine-wide locks live (default ~/.cache/tooling/locks)
-#   TOOLING_LOCK_TIMEOUT       seconds to wait for the stack lock (default 900)
+#   TOOLING_LOCK_TIMEOUT       seconds to wait for the stack lock (default 600)
+#   TOOLING_LOCK_NOTICE_EVERY  seconds between 'waiting for the lock' lines (default 60; one prints at the start)
 #   TOOLING_LOCK_INTERVAL      seconds between retries (default 5)
 #   TOOLING_LOCK_STALE_AFTER   seconds before a lock whose container is not running counts as stale (default 300)
 #
@@ -97,28 +98,47 @@ lock_stale() {
   [ "$age" -ge "${TOOLING_LOCK_STALE_AFTER:-300}" ]
 }
 
+lock_clear() { rm -f "$LOCK/owner" "$LOCK/container" "$LOCK/pid" "$LOCK/cmd" "$LOCK/cwd"; rmdir "$LOCK" 2>/dev/null || true; }
+
+# Who holds it, for messages: the stack name plus the pid, command and directory recorded when it was taken.
+lock_holder() {
+  local pid cmd cwd s
+  pid="$(cat "$LOCK/pid" 2>/dev/null || true)"; cmd="$(cat "$LOCK/cmd" 2>/dev/null || true)"; cwd="$(cat "$LOCK/cwd" 2>/dev/null || true)"
+  if [ -n "$pid" ]; then s="pid $pid (stack $(lock_owner))"; else s="stack $(lock_owner)"; fi
+  if [ -n "$cmd" ] || [ -n "$cwd" ]; then s="$s: ${cmd:-?}${cwd:+ in $cwd}"; fi
+  printf '%s' "$s"
+}
+
+# Waiting is never silent: one line when the wait starts, then one every TOOLING_LOCK_NOTICE_EVERY seconds.
 lock_acquire() {
-  local timeout="${TOOLING_LOCK_TIMEOUT:-900}" interval="${TOOLING_LOCK_INTERVAL:-5}" waited=0
+  local timeout="${TOOLING_LOCK_TIMEOUT:-600}" interval="${TOOLING_LOCK_INTERVAL:-5}" notice="${TOOLING_LOCK_NOTICE_EVERY:-60}"
+  local waited=0 last=-1
   mkdir -p "$(dirname "$LOCK")"
   while ! mkdir "$LOCK" 2>/dev/null; do
     if lock_mine; then return 0; fi
     if lock_stale; then
       echo "… breaking a stale stack lock held by $(lock_owner) (its container is not running)" >&2
-      rm -f "$LOCK/owner" "$LOCK/container"; rmdir "$LOCK" 2>/dev/null || true
+      lock_clear
       continue
     fi
     if [ "$waited" -ge "$timeout" ]; then
-      echo "✗ LOCAL: another Supabase stack still holds $LOCK after ${timeout}s ($(lock_owner)). Stop it with its 'make local-down'." >&2
+      echo "✗ LOCAL: gave up waiting for the Supabase stack lock after ${waited} s (held by $(lock_holder)). Stop that stack with its 'make local-down'." >&2
       return 1
     fi
-    echo "… waiting for the machine-wide Supabase stack lock ($(lock_owner) holds $LOCK), retrying every ${interval}s" >&2
+    if [ "$last" -lt 0 ] || [ $((waited - last)) -ge "$notice" ]; then
+      echo "… waiting for the Supabase stack lock (held by $(lock_holder)) ${waited} s" >&2
+      last=$waited
+    fi
     sleep "$interval"; waited=$((waited + interval))
   done
   printf '%s\n' "$OWNER" > "$LOCK/owner"
   printf '%s\n' "$DB" > "$LOCK/container"
+  printf '%s\n' "$PPID" > "$LOCK/pid"
+  { ps -o command= -p "$PPID" 2>/dev/null | cut -c1-120; } > "$LOCK/cmd" || true
+  printf '%s\n' "$ROOT" > "$LOCK/cwd"
 }
 
-lock_release() { if lock_mine; then rm -f "$LOCK/owner" "$LOCK/container"; rmdir "$LOCK" 2>/dev/null || true; fi; }
+lock_release() { if lock_mine; then lock_clear; fi; }
 
 # --- facts ------------------------------------------------------------------------------------------
 check_loopback() {

@@ -59,7 +59,8 @@ IOS_SIM_DEVICE=iPhone 17 Pro
 | `SUPABASE_LOCAL_AFTER_UP` | Command run in the app root after `local-up`, for example seeding |
 | `IOS_SIM_DEVICE` | Simulator name for `ios-sim` |
 | `TOOLING_LOCK_DIR` | Machine-wide locks (default `~/.cache/tooling/locks`) |
-| `TOOLING_LOCK_TIMEOUT` / `TOOLING_LOCK_INTERVAL` | Seconds to wait for the stack lock (900) and between tries (5) |
+| `TOOLING_LOCK_TIMEOUT` / `TOOLING_LOCK_INTERVAL` | Seconds to wait for the stack lock (600) and between tries (5) |
+| `TOOLING_LOCK_NOTICE_EVERY` | Seconds between "waiting for the lock" lines (60); one prints when the wait starts |
 | `TOOLING_STOP_WAIT` | Seconds `functions-down` waits after TERM before KILL (10) |
 | `TOOLING_LOCK_STALE_AFTER` | Seconds before a lock whose container is not running is broken (300) |
 
