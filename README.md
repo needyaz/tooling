@@ -123,6 +123,7 @@ Copies `VERSION`, `README.md`, `mk/` and `bin/` into `my-app/tooling/`, removes 
 - `local-up` starts from a generated copy of `supabase/config.toml` in `build/local-supabase/` with boot migrations off. The app's `config.toml` is never changed.
 - `local-functions` serves the app's functions with fake per-run secrets (`FN_VERSION`, `ADMIN_SECRET`) and no provider keys. It refuses an explicit `ENV` other than `local`.
 - `functions-up` runs `supabase functions serve` in its own process group (`setsid`, or python3 `os.setsid` where there is none) and records the group id. `functions-down` sends TERM to the whole group, waits `TOOLING_STOP_WAIT` seconds (10), sends KILL, and warns if processes remain. A group whose leader died counts as running for stop and is never reused: `functions-up` stops it and starts fresh.
+- Copying the functions into the edge runtime goes through a snapshot of the staged tree and is retried (`TOOLING_PUSH_TRIES`, default 3) with a fresh stage container each time, because `docker cp` can fail under load ("missed writing N bytes", "unexpected EOF").
 - `db-url` prints `postgresql://postgres:postgres@127.0.0.1:<port>/postgres` for `supabase db push --db-url`. The port is `SUPABASE_LOCAL_DB_PORT` (default 54322; digits only, 1-65535, no leading zero, otherwise an error). It does not need the stack running.
 - Nothing links, logs in or contacts a remote project.
 

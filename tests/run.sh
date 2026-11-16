@@ -26,6 +26,12 @@ case "$1" in
   inspect)
     for a in "$@"; do last="$a"; done
     if [ -f "$STUB_STATE/running/$last" ]; then echo true; else echo false; exit 1; fi ;;
+  cp)
+    n="$(cat "$STUB_STATE/cp-fail" 2>/dev/null || echo 0)"
+    if [ "$n" -gt 0 ]; then
+      echo $((n - 1)) > "$STUB_STATE/cp-fail"
+      echo 'Error response from daemon: unexpected EOF' >&2; exit 1
+    fi ;;
 esac
 exit 0
 EOF
@@ -193,7 +199,7 @@ for bad in abc 0 054322 65536 -1 5432.1 '' ' 5432' 1234567890123; do
 done
 
 echo "supabase-local functions (process group)"
-export SUPABASE_LOCAL_ID=fnapp TOOLING_STOP_WAIT=2
+export SUPABASE_LOCAL_ID=fnapp TOOLING_STOP_WAIT=2 SUPABASE_LOCAL_URL=http://127.0.0.1:1
 mkdir -p "$APP/supabase/functions/fn-version"; echo x > "$APP/supabase/functions/fn-version/index.ts"
 reset_stack; rm -f "$STATE/fn-child"
 SL up >/dev/null 2>&1
@@ -217,9 +223,24 @@ out="$(SL functions-up 2>&1)"; st=$?
 child2="$(cat "$STATE/fn-child")"; leader2="$(cat "$BW/functions.pid")"
 check "functions-up stops a leaderless group and starts a fresh one" \
   "$([ $st -eq 0 ] && gone "$child1" && [ "$child2" != "$child1" ] && alive "$child2" && alive "$leader2" && [ "$leader2" != "$leader1" ] && echo 0 || echo 1)" "$out"
+SL functions-down >/dev/null 2>&1
+export TOOLING_PUSH_RETRY_WAIT=0
+: > "$STUB_LOG"; echo 1 > "$STATE/cp-fail"
+out="$(SL functions-up 2>&1)"; st=$?
+check "a failed docker cp is retried with a fresh stage container" \
+  "$([ $st -eq 0 ] && [ "$(grep -c '^docker cp' "$STUB_LOG")" = 2 ] && [ "$(grep -c '^docker create' "$STUB_LOG")" = 2 ] && echo "$out" | grep -q 'retrying' && echo 0 || echo 1)" "$out"
+check "no snapshot is left behind" "$([ -z "$(ls -A "$BW" | grep '^\.fn-push')" ] && echo 0 || echo 1)"
+SL functions-down >/dev/null 2>&1
+: > "$STUB_LOG"; echo 3 > "$STATE/cp-fail"
+out="$(SL functions-up 2>&1)"; st=$?
+check "gives up after 3 failed attempts" "$([ $st -ne 0 ] && [ "$(grep -c '^docker cp' "$STUB_LOG")" = 3 ] && echo "$out" | grep -q 'failed 3 times' && echo 0 || echo 1)" "$out"
+check "a failed push leaves no snapshot either" "$([ -z "$(ls -A "$BW" | grep '^\.fn-push')" ] && echo 0 || echo 1)"
+rm -f "$STATE/cp-fail"; unset TOOLING_PUSH_RETRY_WAIT
+SL functions-down >/dev/null 2>&1
+SL functions-up >/dev/null 2>&1
 SL down >/dev/null 2>&1
 check "down also stops the functions group" "$(gone "$child2" && echo 0 || echo 1)"
-unset SUPABASE_LOCAL_ID TOOLING_STOP_WAIT
+unset SUPABASE_LOCAL_ID TOOLING_STOP_WAIT SUPABASE_LOCAL_URL
 
 echo "supabase-local abs-workdir"
 mkdir -p "$T/real/app/tooling" "$T/real/app/supabase"

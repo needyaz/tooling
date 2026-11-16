@@ -246,14 +246,32 @@ fn_answers() {
 # The runtime bind-mounts the functions dir read-only by host path, and a Docker VM may not share that
 # host path, so the mount can come up empty. Copy the staged tree into the VM directory through a
 # throwaway container created (never started) from the runtime's own cached image.
+#
+# `docker cp` can fail under load ("missed writing N bytes", "unexpected EOF": a file shrank while tar read
+# it, or the daemon dropped the stream). So the tree is first copied to a snapshot nothing else writes to,
+# and the copy is retried (TOOLING_PUSH_TRIES, default 3) with a fresh stage container each time.
 fn_push_tree() {
-  local img stg abs
+  local img stg abs snap tries=0 max="${TOOLING_PUSH_TRIES:-3}" ok
   abs="$(cd -P "$WD" && pwd -P)"
   img="$(docker inspect -f '{{.Config.Image}}' "$EDGE")"
   stg="${PID}-fn-stage-$$"
-  docker create --name "$stg" -v "$abs/supabase/functions:/dst" "$img" true >/dev/null
-  docker cp "$FN_DIR/." "$stg:/dst/"
-  docker rm "$stg" >/dev/null
+  snap="$(mktemp -d "$WD/.fn-push.XXXXXX")"
+  cp -R "$FN_DIR/." "$snap/"
+  while :; do
+    tries=$((tries + 1))
+    docker rm -f "$stg" >/dev/null 2>&1 || true
+    if docker create --name "$stg" -v "$abs/supabase/functions:/dst" "$img" true >/dev/null \
+       && docker cp "$snap/." "$stg:/dst/"; then ok=1; else ok=0; fi
+    docker rm -f "$stg" >/dev/null 2>&1 || true
+    [ "$ok" = 1 ] && break
+    if [ "$tries" -ge "$max" ]; then
+      rm -rf "$snap"
+      die "copying the functions into the edge runtime failed $tries times (docker cp)"
+    fi
+    echo "… docker cp into the edge runtime failed (attempt $tries of $max), retrying" >&2
+    sleep "${TOOLING_PUSH_RETRY_WAIT:-2}"
+  done
+  rm -rf "$snap"
 }
 
 # Fake secrets only: FN_VERSION and a random ADMIN_SECRET. Provider secrets stay unset so a function that
